@@ -129,8 +129,8 @@ const char MAIN_PAGE_HTML[] PROGMEM = R"rawliteral(
 </div>
 </body></html>)rawliteral";
 
-const uint8_t R_PIN = 4; // D1
-const uint8_t G_PIN = 5; // D2
+const uint8_t R_PIN = 4; // D2
+const uint8_t G_PIN = 5; // D1
 const uint8_t B_PIN = 14; // D5
 const uint8_t BUTTON_PIN = 12; // D6
 
