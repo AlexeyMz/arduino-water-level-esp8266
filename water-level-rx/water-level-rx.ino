@@ -30,7 +30,7 @@ const char MAIN_PAGE_HTML[] PROGMEM = R"rawliteral(
 <html>
 <head>
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>WaterMeter.RX</title>
+  <title>Water Level RX</title>
 </head>
 <body>
 <style type="text/css">
@@ -97,7 +97,7 @@ const char MAIN_PAGE_HTML[] PROGMEM = R"rawliteral(
   });
 </script>
 <div class="main">
-  <h2>WaterMeter.RX</h2>
+  <h2>Water Level RX</h2>
 
   <ul class="tabs">
     <li class="tab" data-tab="sensor-tab">Sensor</li>
