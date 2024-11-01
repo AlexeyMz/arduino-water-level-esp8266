@@ -1,15 +1,14 @@
 #include <ArduinoJson.h>
-#include <DNSServer.h>
 #include <EEPROM.h>
-#include <ESP8266WiFi.h>
-#include <ESP8266WebServer.h>
 
 #include <cstdint>
+#include <memory>
 #include <string>
 
 #include "blink_pattern.h"
 #include "button.h"
 #include "colors.h"
+#include "server.h"
 
 enum class State {
   Initial,
@@ -22,113 +21,6 @@ enum class State {
 
 State state = State::Initial;
 
-DNSServer dnsServer;
-ESP8266WebServer webServer(80);
-
-const char MAIN_PAGE_HTML[] PROGMEM = R"rawliteral(
-<!DOCTYPE html>
-<html>
-<head>
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Water Level RX</title>
-</head>
-<body>
-<style type="text/css">
-  .main { display: flex; flex-direction: column; align-items: center; }
-
-  .tabs { display: flex; padding: 0; }
-  .tab { list-style-type: none; margin: 0 5px; padding: 2px; border: 1px solid gray; cursor: pointer; }
-  .tab.active { background: aquamarine; }
-  .tab-content { visibility: collapse; display: flex; flex-direction: column; }
-  .tab-content.active { visibility: visible; }
-
-  form { display: flex; flex-direction: column; }
-  form > input { margin-bottom: 5px; }
-  .error { color:red; }
-</style>
-<script>
-  const $ = document.querySelector.bind(document);
-  document.addEventListener('DOMContentLoaded', () => {
-    function activateTab(tab) {
-      const tabId = tab.getAttribute('data-tab');
-      if (tabId) {
-        document.querySelectorAll('.tab-content, .tab').forEach(el => el.classList.remove('active'));
-        document.getElementById(tabId).classList.add('active');
-        tab.classList.add('active');
-      }
-    }
-
-    $('.tabs').addEventListener('click', e => {
-      if (e.target instanceof HTMLElement) {
-        activateTab(e.target);
-      }
-    });
-
-    activateTab($('.tab:first-child'));
-
-    async function fetchJson(url, request) {
-      const response = await fetch(url, request);
-      if (!response.ok) {
-        throw new Error(`Request failed: ${response.status} ${response.statusText}`);
-      }
-      return await response.json();
-    }
-
-    setInterval(async () => {
-      try {
-        const data = await fetchJson('/sensor');
-        $('#sensor-value').innerText = data.value;
-        $('#sensor-error').innerText = '';
-      } catch (e) {
-        $('#sensor-error').innerText = e.message;
-      }
-    }, 500);
-
-    (async function () {
-      try {
-        const settings = await fetchJson('/connect-settings');
-        $('#connect-ssid').value = settings.ssid;
-        $('#connect-pass').value = settings.password;
-        $('#connect-error').innerText = '';
-      } catch (e) {
-        $('#connect-error').innerText = e.message;
-      }
-    })();
-  });
-</script>
-<div class="main">
-  <h2>Water Level RX</h2>
-
-  <ul class="tabs">
-    <li class="tab" data-tab="sensor-tab">Sensor</li>
-    <li class="tab" data-tab="connect-tab">Connect</li>
-    <li class="tab" data-tab="calibrate-tab">Calibrate</li>
-  </ul>
-
-  <section id="sensor-tab" class="tab-content">
-    <h3>Sensor</h3>
-    <div>Raw value: <span id='sensor-value'>&mdash;</span></div>
-    <div class='error' id='sensor-error'></div>
-  </section>
-
-  <section id="connect-tab" class="tab-content">
-    <h3>Connect</h3>
-    <form method="POST" action="/connect" autocomplete="off">
-      <label for="connect-ssid">SSID:</label>
-      <input type="text" id="connect-ssid" name="ssid">
-      <label for="connect-pass">Password:</label>
-      <input type="text" id="connect-pass" name="password">
-      <input type="submit" value="Connect">
-    </form>
-    <div class='error' id='connect-error'></div>
-  </section>
-
-  <section id="calibrate-tab" class="tab-content">
-    <h3>Calibrate</h3>
-  </section>
-</div>
-</body></html>)rawliteral";
-
 const uint8_t R_PIN = 4; // D2
 const uint8_t G_PIN = 5; // D1
 const uint8_t B_PIN = 14; // D5
@@ -136,17 +28,19 @@ const uint8_t BUTTON_PIN = 12; // D6
 
 Button button(BUTTON_PIN);
 
-enum class ConnectMode { Default, ForceAP };
-const uint16_t DISCONNECT_TIMEOUT = 5000;
-wl_status_t lastWiFiStatus;
-uint32_t lastSensorReadTime = 0;
-uint32_t lastActivityTime = 0;
-
 BlinkPattern blinking;
 RgbColor ledColor = { 0, 0, 0 };
 
+const uint16_t SENSOR_READ_INTERVAL = 1000;
+const size_t SENSOR_VALUES_COUNT = 10;
+uint32_t lastSensorRead = 0;
+size_t nextSensorValueIndex = 0;
+int sensorValues[SENSOR_VALUES_COUNT];
+
+const uint16_t ASSUME_INACTIVE_TIMEOUT = 5000;
+
 const uint32_t EEPROM_MAGIC = 0xABCD4321;
-const uint32_t EEPROM_VERSION = 1;
+const uint32_t EEPROM_VERSION = 2;
 const size_t MAX_SSID_LENGTH = 32;
 const size_t MAX_PASSWORD_LENGTH = 64;
 
@@ -155,12 +49,216 @@ struct EepromData {
   uint32_t version;
   char ssid[MAX_SSID_LENGTH];
   char password[MAX_PASSWORD_LENGTH];
+  float rawPerDepth;
+  float depthOffset;
 };
 
 EepromData storedData;
 
 bool isValidEepromData(const EepromData &data) {
   return data.magic == EEPROM_MAGIC && data.version == EEPROM_VERSION;
+}
+
+class WlrxServer : public RestServer {
+private:
+  wl_status_t lastWiFiStatus;
+  uint32_t lastActivityTime;
+  uint32_t lastSensorRequestTime;
+
+public:
+  enum class ConnectMode { Default, ForceAP };
+
+  WlrxServer()
+    : lastWiFiStatus(WL_DISCONNECTED),
+    lastActivityTime(0),
+    lastSensorRequestTime(0)
+  {}
+
+  wl_status_t updateWiFiStatus() {
+    auto status = wiFiStatus();
+    if (status != lastWiFiStatus) {
+      Serial.print("WiFi has changed status: ");
+      Serial.print(lastWiFiStatus);
+      Serial.print(" -> ");
+      Serial.println(status);
+      lastWiFiStatus = status;
+    }
+    return status;
+  }
+
+  void updateActivityTime() {
+    lastActivityTime = millis();
+  }
+
+  bool isInactiveFor(uint32_t time, uint32_t span) {
+    return time >= (lastActivityTime + span);
+  }
+
+  bool hasNotRequestedSensorFor(uint32_t time, uint32_t span) {
+    return time >= (lastSensorRequestTime + span);
+  }
+
+  void start(ConnectMode mode) {
+    if (mode == ConnectMode::Default && strlen(storedData.ssid) > 0) {
+      Serial.print("Connecting to WiFi, SSID = ");
+      Serial.println(storedData.ssid);
+      connectToNetwork(storedData.ssid, storedData.password);
+      transitionToState(State::ConnectingToWiFi);
+    } else {
+      Serial.println("Starting WiFi AP");
+      startAccessPoint("ZF_Water_Meter", "J4242what");
+      transitionToState(State::OpenAccessPoint);
+    }
+
+    updateWiFiStatus();
+  }
+
+protected:
+  bool inReadonlyMode() {
+    return WiFi.getMode() != WIFI_AP;
+  }
+
+  void setupHandlers() override {
+    webServer.on("/sensor", HTTP_GET, [=]{ this->handleSensor(); });
+    webServer.on("/connect-settings", HTTP_GET, [=]{ this->handleConnectSettings(); });
+    webServer.on("/connect", HTTP_POST, [=]{ this->handleConnect(); });
+    webServer.on("/calibration", HTTP_GET, [=]{ this->handleGetCalibration(); });
+    webServer.on("/calibration", HTTP_POST, [=]{ this->handleSetCalibration(); });
+  }
+
+  void handleMain() override {
+    updateActivityTime();
+    transitionToState(State::ReadyToWork);
+    RestServer::handleMain();
+  }
+
+  void handleSensor() {
+    updateActivityTime();
+  
+    if (state == State::ReadyToWork) {
+      transitionToState(State::ReadingSensor);
+      lastSensorRequestTime = millis();
+    }
+
+    float average = 0;
+    for (auto value : sensorValues) {
+      average += value;
+    }
+    average /= SENSOR_VALUES_COUNT;
+
+    float varience = 0;
+    for (auto value : sensorValues) {
+      float difference = (value - average);
+      varience += difference * difference;
+    }
+
+    JsonDocument doc;
+    doc["value"] = (average / storedData.rawPerDepth) - storedData.depthOffset;
+    doc["standardDeviation"] = sqrt(varience) / storedData.rawPerDepth;
+    doc["rawValue"] = average;
+    doc["unit"] = "m";
+
+    std::string response;
+    serializeJsonPretty(doc, response);
+    webServer.send(200, "application/json", response.c_str());
+  }
+
+  void handleConnectSettings() {
+    JsonDocument doc;
+    doc["ssid"] = storedData.ssid;
+    doc["password"] = "(hidden)";
+
+    std::string response;
+    serializeJsonPretty(doc, response);
+    webServer.send(200, "application/json", response.c_str());
+  }
+
+  void handleConnect() {
+    Serial.println("Received request to change connection settings");
+    if (!webServer.hasArg("ssid")) {
+      webServer.send(400, "text/plain", "Missing 'ssid' argument");
+      return;
+    } else if (!webServer.hasArg("password")) {
+      webServer.send(400, "text/plain", "Missing 'password' argument");
+      return;
+    } else if (inReadonlyMode()) {
+      webServer.send(403, "text/plain", "Connections settings can only be modified in AP mode");
+      return;
+    }
+
+    std::string ssid = webServer.arg("ssid").c_str();
+    std::string password = webServer.arg("password").c_str();
+
+    if (ssid.size() >= MAX_SSID_LENGTH) {
+      webServer.send(422, "text/plain", "Too long 'ssid' string");
+      return;
+    } else if (password.size() >= MAX_PASSWORD_LENGTH) {
+      webServer.send(422, "text/plain", "Too long 'password' string");
+      return;
+    }
+
+    snprintf(&storedData.ssid[0], MAX_SSID_LENGTH, "%s", ssid.c_str());
+    snprintf(&storedData.password[0], MAX_PASSWORD_LENGTH, "%s", password.c_str());
+    EEPROM.put(0, storedData);
+    EEPROM.commit();
+
+    Serial.print("Changed connection settings: SSID = ");
+    Serial.print(storedData.ssid);
+    Serial.print(", password = ");
+    Serial.println(storedData.password);
+
+    Serial.println("Restarting WiFi after settings change");
+    transitionToState(State::Initial);
+
+    stop();
+    start(ConnectMode::Default);
+  }
+
+  void handleGetCalibration() {
+    JsonDocument doc;
+    doc["rawPerDepth"] = storedData.rawPerDepth;
+    doc["depthOffset"] = storedData.depthOffset;
+
+    std::string response;
+    serializeJsonPretty(doc, response);
+    webServer.send(200, "application/json", response.c_str());
+  }
+
+  void handleSetCalibration() {
+    Serial.println("Received request to change calibration data");
+    if (!webServer.hasArg("rawPerDepth")) {
+      webServer.send(400, "text/plain", "Missing 'rawPerDepth' argument");
+      return;
+    } else if (!webServer.hasArg("depthOffset")) {
+      webServer.send(400, "text/plain", "Missing 'depthOffset' argument");
+      return;
+    } else if (inReadonlyMode()) {
+      webServer.send(403, "text/plain", "Calibration data can only be modified in AP mode");
+      return;
+    }
+
+    float rawPerDepth;
+    if (!tryParseFloat(webServer.arg("rawPerDepth").c_str(), rawPerDepth)) {
+      webServer.send(400, "text/plain", "Invalid 'rawPerDepth' argument");
+    }
+
+    float depthOffset;
+    if (!tryParseFloat(webServer.arg("depthOffset").c_str(), depthOffset)) {
+      webServer.send(400, "text/plain", "Invalid 'depthOffset' argument");
+    }
+
+    storedData.rawPerDepth = rawPerDepth;
+    storedData.depthOffset = depthOffset;
+    EEPROM.put(0, storedData);
+    EEPROM.commit();
+  }
+} server;
+
+bool tryParseFloat(const char *str, float &result) {
+  char* parseEnd = nullptr;
+  errno = 0;
+  result = std::strtof(str, &parseEnd);
+  return errno == 0 && parseEnd != str && parseEnd != nullptr && *parseEnd != 0;
 }
 
 void setup() {
@@ -180,19 +278,39 @@ void setup() {
     memset(&storedData, 0, sizeof(storedData));
     storedData.magic = EEPROM_MAGIC;
     storedData.version = EEPROM_VERSION;
+    storedData.rawPerDepth = 120;
+    storedData.depthOffset = 0;
   }
 
+  int initial_sensor_value = analogRead(A0);
+  for (size_t i = 0; i < SENSOR_VALUES_COUNT; i++) {
+    sensorValues[i] = initial_sensor_value;
+  }
+  lastSensorRead = millis();
+
   transitionToState(State::Initial);
-  serverStart(ConnectMode::Default);
+  server.start(WlrxServer::ConnectMode::Default);
 }
 
 void loop() {
   auto time = millis();
-  serverTick();
+
+  if (time >= lastSensorRead + SENSOR_READ_INTERVAL) {
+    sensorValues[nextSensorValueIndex] = analogRead(A0);
+    nextSensorValueIndex++;
+    if (nextSensorValueIndex >= SENSOR_VALUES_COUNT) {
+      nextSensorValueIndex = 0;
+    }
+    lastSensorRead = time;
+  }
+  
+  if (state != State::Initial) {
+    server.update();
+  }
 
   button.update(time);
   if (button.isPressed()) {
-    updateActivityTime();
+    server.updateActivityTime();
   }
 
   if (blinking.update(time)) {
@@ -203,30 +321,39 @@ void loop() {
     }
   }
 
-  if (WiFi.status() != lastWiFiStatus) {
-    Serial.print("WiFi has changed status: ");
-    Serial.print(lastWiFiStatus);
-    Serial.print(" -> ");
-    Serial.println(WiFi.status());
-    lastWiFiStatus = WiFi.status();
-  }
+  auto wiFiStatus = server.updateWiFiStatus();
 
   switch (state) {
     case State::ConnectingToWiFi:
-      if (WiFi.status() == WL_CONNECTED) {
+      if (wiFiStatus == WL_CONNECTED) {
         Serial.print("WiFi connected: ");
-        Serial.println(WiFi.status());
+        Serial.println(wiFiStatus);
         transitionToState(State::ReadyToWork);
-      } else if (WiFi.status() == WL_WRONG_PASSWORD) {
+      } else if (wiFiStatus == WL_WRONG_PASSWORD) {
         Serial.print("Wrong WiFi password for SSID = ");
         Serial.println(storedData.ssid);
         transitionToState(State::ConnectionError);
+      } else if (
+        wiFiStatus == WL_CONNECT_FAILED ||
+        wiFiStatus == WL_CONNECTION_LOST ||
+        wiFiStatus == WL_DISCONNECTED
+      ) {
+        Serial.print("Other connection error: ");
+        Serial.println(wiFiStatus);
+        transitionToState(State::ConnectionError);
+      }
+      break;
+    case State::ConnectionError:
+      if (wiFiStatus == WL_CONNECTED) {
+        Serial.print("WiFi re-connected: ");
+        Serial.println(wiFiStatus);
+        transitionToState(State::ReadyToWork);
       }
       break;
     case State::ReadyToWork:
       if (WiFi.getMode() == WIFI_AP) {
-        if (time >= (lastActivityTime + DISCONNECT_TIMEOUT)) {
-          Serial.println("Disconnected by timeout in AP mode");
+        if (server.isInactiveFor(time, ASSUME_INACTIVE_TIMEOUT)) {
+          Serial.println("Assumed inactive by timeout in AP mode");
           transitionToState(State::OpenAccessPoint);
         }
       } else if (WiFi.getMode() == WIFI_STA) {
@@ -238,7 +365,7 @@ void loop() {
       }
       break;
     case State::ReadingSensor:
-      if (time >= (lastSensorReadTime + 300)) {
+      if (server.hasNotRequestedSensorFor(time, 300)) {
         transitionToState(State::ReadyToWork);
       }
       break;
@@ -253,8 +380,8 @@ void loop() {
     if (button.isPressedFor(time, 3000)) {
       Serial.println("Force-restart WiFi in AP mode");
       transitionToState(State::Initial);
-      serverStop();
-      serverStart(ConnectMode::ForceAP);
+      server.stop();
+      server.start(WlrxServer::ConnectMode::ForceAP);
     }
   }
 }
@@ -281,135 +408,11 @@ void transitionToState(State nextState) {
       blinking.setPattern(1000, 0);
       break;
     case State::ReadingSensor:
-      lastSensorReadTime = millis();
       ledColor = { 0, 0, 255 };
       blinking.setPattern(500, 0);
       break;
   }
   state = nextState;
-}
-
-void serverStart(ConnectMode mode) {
-  if (mode == ConnectMode::Default && strlen(storedData.ssid) > 0) {
-    Serial.print("Connecting to WiFi, SSID = ");
-    Serial.println(storedData.ssid);
-
-    WiFi.mode(WIFI_STA);
-    WiFi.begin(storedData.ssid, storedData.password);
-
-    webServer.on("/", HTTP_GET, webServer_handleMain);
-    webServer.on("/sensor", HTTP_GET, webServer_handleSensor);
-    webServer.on("/connect-settings", HTTP_GET, webServer_handleConnectSettings);
-    webServer.on("/connect", HTTP_POST, webServer_handleConnect);
-    webServer.begin();
-  
-    transitionToState(State::ConnectingToWiFi);
-  } else {
-    Serial.println("Starting WiFi AP");
-
-    IPAddress apIP(192, 168, 1, 1);
-    IPAddress subnet(255, 255, 255, 0);
-    WiFi.mode(WIFI_AP);
-    WiFi.softAPConfig(apIP, apIP, subnet);
-    WiFi.softAP("ZF_Water_Meter", "J4242what");
-    dnsServer.start(53, "*", apIP);
-
-    webServer.onNotFound(webServer_handleMain);
-    webServer.on("/sensor", HTTP_GET, webServer_handleSensor);
-    webServer.on("/connect-settings", HTTP_GET, webServer_handleConnectSettings);
-    webServer.on("/connect", HTTP_POST, webServer_handleConnect);
-    webServer.begin();
-  
-    transitionToState(State::OpenAccessPoint);
-  }
-
-  lastWiFiStatus = WiFi.status();
-}
-
-void serverStop() {
-  dnsServer.stop();
-  webServer.stop();
-  WiFi.disconnect();
-}
-
-void serverTick() {
-  if (state != State::Initial) {
-    dnsServer.processNextRequest();
-    webServer.handleClient();
-  }
-}
-
-void webServer_handleMain() {
-  updateActivityTime();
-  transitionToState(State::ReadyToWork);
-  webServer.send(200, "text/html", MAIN_PAGE_HTML);
-}
-
-void webServer_handleSensor() {
-  updateActivityTime();
-  if (state == State::ReadyToWork) {
-    transitionToState(State::ReadingSensor);
-  }
-
-  int value = analogRead(A0);
-
-  JsonDocument doc;
-  doc["value"] = value;
-
-  std::string response;
-  serializeJsonPretty(doc, response);
-  webServer.send(200, "application/json", response.c_str());
-}
-
-void webServer_handleConnectSettings() {
-  JsonDocument doc;
-  doc["ssid"] = storedData.ssid;
-  doc["password"] = "(hidden)";
-
-  std::string response;
-  serializeJsonPretty(doc, response);
-  webServer.send(200, "application/json", response.c_str());
-}
-
-void webServer_handleConnect() {
-  Serial.println("Received request to change connection settings");
-  if (!webServer.hasArg("ssid")) {
-    webServer.send(400, "text/plain", "Missing 'ssid' argument");
-    return;
-  } else if (!webServer.hasArg("password")) {
-    webServer.send(400, "text/plain", "Missing 'password' argument");
-    return;
-  }
-
-  std::string ssid = webServer.arg("ssid").c_str();
-  std::string password = webServer.arg("password").c_str();
-
-  if (ssid.size() >= MAX_SSID_LENGTH) {
-    webServer.send(422, "text/plain", "Too long 'ssid' string");
-    return;
-  } else if (password.size() >= MAX_PASSWORD_LENGTH) {
-    webServer.send(422, "text/plain", "Too long 'password' string");
-    return;
-  }
-
-  snprintf(&storedData.ssid[0], MAX_SSID_LENGTH, "%s", ssid.c_str());
-  snprintf(&storedData.password[0], MAX_PASSWORD_LENGTH, "%s", password.c_str());
-  EEPROM.put(0, storedData);
-  EEPROM.commit();
-
-  Serial.print("Changed connection settings: SSID = ");
-  Serial.print(storedData.ssid);
-  Serial.print(", password = ");
-  Serial.println(storedData.password);
-
-  Serial.println("Restarting WiFi after settings change");
-  transitionToState(State::Initial);
-  serverStop();
-  serverStart(ConnectMode::Default);
-}
-
-void updateActivityTime() {
-  lastActivityTime = millis();
 }
 
 void writeLedColor(byte r, byte g, byte b) {
