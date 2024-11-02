@@ -1,11 +1,13 @@
-#include <functional>
+#include <string>
 
 #include "server.h"
-#include "server_html.h"
 
 RestServer::RestServer()
-  : webServer(80)
-{}
+  : webServer(80),
+  indexHtml(nullptr)
+{
+  indexHtml = assets.find("index.html");
+}
 
 wl_status_t RestServer::wiFiStatus() {
   return WiFi.status();
@@ -23,6 +25,7 @@ void RestServer::startAccessPoint(
   dnsServer.start(53, "*", apIP);
 
   webServer.onNotFound([=]{ this->handleMain(); });
+  registerAssets();
   setupHandlers();
   webServer.begin();
 }
@@ -35,8 +38,19 @@ void RestServer::connectToNetwork(
   WiFi.begin(ssid, password);
 
   webServer.on("/", HTTP_GET, [=]{ this->handleMain(); });
+  registerAssets();
   setupHandlers();
   webServer.begin();
+}
+
+void RestServer::registerAssets() {
+  for (const AssetEntry &asset : assets) {
+    std::string path = "/";
+    path += asset.name;
+    webServer.on(path.c_str(), HTTP_GET, [=, &asset]{
+      webServer.send(200, asset.contentType, asset.content);
+    });
+  }
 }
 
 void RestServer::update() {
@@ -53,5 +67,5 @@ void RestServer::stop() {
 void RestServer::setupHandlers() {}
 
 void RestServer::handleMain() {
-  webServer.send(200, "text/html", MAIN_PAGE_HTML);
+  webServer.send(200, indexHtml->contentType, indexHtml->content);
 }
