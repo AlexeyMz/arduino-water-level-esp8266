@@ -43,14 +43,16 @@ const uint32_t EEPROM_MAGIC = 0xABCD4321;
 const uint32_t EEPROM_VERSION = 2;
 const size_t MAX_SSID_LENGTH = 32;
 const size_t MAX_PASSWORD_LENGTH = 64;
+const float DEFAULT_K_COEFF = 120;
+const float DEFAULT_P_ZERO = 100;
 
 struct EepromData {
   uint32_t magic;
   uint32_t version;
   char ssid[MAX_SSID_LENGTH];
   char password[MAX_PASSWORD_LENGTH];
-  float rawPerDepth;
-  float depthOffset;
+  float calibrationKCoeff;
+  float calibrationPZero;
 };
 
 EepromData storedData;
@@ -140,23 +142,16 @@ protected:
       lastSensorRequestTime = millis();
     }
 
-    float average = 0;
-    for (auto value : sensorValues) {
-      average += value;
-    }
-    average /= SENSOR_VALUES_COUNT;
-
-    float varience = 0;
-    for (auto value : sensorValues) {
-      float difference = (value - average);
-      varience += difference * difference;
-    }
+    float rawPressure = 0;
+    float depth = 0;
+    float depthDeviation = 0;
+    computeSensorData(rawPressure, depth, depthDeviation);
 
     JsonDocument doc;
-    doc["value"] = (average / storedData.rawPerDepth) - storedData.depthOffset;
-    doc["standardDeviation"] = sqrt(varience) / storedData.rawPerDepth;
-    doc["rawValue"] = average;
-    doc["unit"] = "m";
+    doc["rawPressure"] = rawPressure;
+    doc["depth"] = depth;
+    doc["depthSd"] = depthDeviation;
+    doc["depthUnit"] = "m";
 
     std::string response;
     serializeJsonPretty(doc, response);
@@ -210,14 +205,17 @@ protected:
     Serial.println("Restarting WiFi after settings change");
     transitionToState(State::Initial);
 
+    webServer.sendHeader("Location", "/");
+    webServer.send(303);
+
     stop();
     start(ConnectMode::Default);
   }
 
   void handleGetCalibration() {
     JsonDocument doc;
-    doc["rawPerDepth"] = storedData.rawPerDepth;
-    doc["depthOffset"] = storedData.depthOffset;
+    doc["kCoeff"] = storedData.calibrationKCoeff;
+    doc["pZero"] = storedData.calibrationPZero;
 
     std::string response;
     serializeJsonPretty(doc, response);
@@ -226,31 +224,42 @@ protected:
 
   void handleSetCalibration() {
     Serial.println("Received request to change calibration data");
-    if (!webServer.hasArg("rawPerDepth")) {
-      webServer.send(400, "text/plain", "Missing 'rawPerDepth' argument");
-      return;
-    } else if (!webServer.hasArg("depthOffset")) {
-      webServer.send(400, "text/plain", "Missing 'depthOffset' argument");
-      return;
-    } else if (inReadonlyMode()) {
+    if (inReadonlyMode()) {
       webServer.send(403, "text/plain", "Calibration data can only be modified in AP mode");
       return;
     }
 
-    float rawPerDepth;
-    if (!tryParseFloat(webServer.arg("rawPerDepth").c_str(), rawPerDepth)) {
-      webServer.send(400, "text/plain", "Invalid 'rawPerDepth' argument");
+    if (!webServer.hasArg("kCoeff")) {
+      webServer.send(400, "text/plain", "Missing 'kCoeff' argument");
+      return;
+    } else if (!webServer.hasArg("pZero")) {
+      webServer.send(400, "text/plain", "Missing 'pZero' argument");
+      return;
+    } 
+
+    float kCoeff = 0;
+    if (!(
+      tryParseFloat(webServer.arg("kCoeff").c_str(), kCoeff) &&
+      std::isfinite(kCoeff) && kCoeff >= 1 && kCoeff <= 1000
+    )) {
+      webServer.send(400, "text/plain", "Invalid 'kCoeff' argument");
     }
 
-    float depthOffset;
-    if (!tryParseFloat(webServer.arg("depthOffset").c_str(), depthOffset)) {
-      webServer.send(400, "text/plain", "Invalid 'depthOffset' argument");
+    float pZero = 0;
+    if (!(
+      tryParseFloat(webServer.arg("pZero").c_str(), pZero) &&
+      std::isfinite(pZero) && pZero >= -1000 && pZero <= 1000
+    )) {
+      webServer.send(400, "text/plain", "Invalid 'pZero' argument");
     }
 
-    storedData.rawPerDepth = rawPerDepth;
-    storedData.depthOffset = depthOffset;
+    storedData.calibrationKCoeff = kCoeff;
+    storedData.calibrationPZero = pZero;
     EEPROM.put(0, storedData);
     EEPROM.commit();
+
+    webServer.sendHeader("Location", "/");
+    webServer.send(303);
   }
 } server;
 
@@ -258,7 +267,7 @@ bool tryParseFloat(const char *str, float &result) {
   char* parseEnd = nullptr;
   errno = 0;
   result = std::strtof(str, &parseEnd);
-  return errno == 0 && parseEnd != str && parseEnd != nullptr && *parseEnd != 0;
+  return errno == 0 && parseEnd != str && parseEnd != nullptr && *parseEnd == 0;
 }
 
 void setup() {
@@ -278,8 +287,8 @@ void setup() {
     memset(&storedData, 0, sizeof(storedData));
     storedData.magic = EEPROM_MAGIC;
     storedData.version = EEPROM_VERSION;
-    storedData.rawPerDepth = 120;
-    storedData.depthOffset = 0;
+    storedData.calibrationKCoeff = DEFAULT_K_COEFF;
+    storedData.calibrationPZero = DEFAULT_P_ZERO;
   }
 
   int initial_sensor_value = analogRead(A0);
@@ -419,4 +428,26 @@ void writeLedColor(byte r, byte g, byte b) {
   analogWrite(R_PIN, r);
   analogWrite(G_PIN, g);
   analogWrite(B_PIN, b);
+}
+
+void computeSensorData(
+  float &rawPressure,
+  float &depth,
+  float &depthDeviation
+) {
+  float average = 0;
+  for (auto value : sensorValues) {
+    average += value;
+  }
+  average /= SENSOR_VALUES_COUNT;
+
+  float variance = 0;
+  for (auto value : sensorValues) {
+    float difference = (value - average);
+    variance += difference * difference;
+  }
+  
+  rawPressure = average;
+  depth = (average - storedData.calibrationPZero) / storedData.calibrationKCoeff;
+  depthDeviation = sqrt(variance) / storedData.calibrationKCoeff;
 }

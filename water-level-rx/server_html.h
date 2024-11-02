@@ -53,9 +53,9 @@ const char MAIN_PAGE_HTML[] PROGMEM = R"rawliteral(
     setInterval(async () => {
       try {
         const data = await fetchJson('/sensor');
-        $('#sensor-value').innerText = data.value.toFixed(4);
-        $('#sensor-sd').innerText = data.standardDeviation.toFixed(4);
-        $('#sensor-raw').innerText = data.rawValue.toFixed(4);
+        $('#sensor-value').innerText = data.depth.toFixed(2);
+        $('#sensor-sd').innerText = data.depthSd.toFixed(2);
+        $('#sensor-raw').innerText = data.rawPressure.toFixed(4);
         $('#sensor-error').innerText = '';
       } catch (e) {
         $('#sensor-error').innerText = e.message;
@@ -76,8 +76,8 @@ const char MAIN_PAGE_HTML[] PROGMEM = R"rawliteral(
     (async function () {
       try {
         const data = await fetchJson('/calibration');
-        $('#calibrate-coeff').value = data.rawPerDepth;
-        $('#calibrate-offset').value = data.depthOffset;
+        $('#calibrate-coeff').value = data.kCoeff;
+        $('#calibrate-offset').value = data.pZero;
         $('#calibrate-error').innerText = '';
       } catch (e) {
         $('#calibrate-error').innerText = e.message;
@@ -97,7 +97,7 @@ const char MAIN_PAGE_HTML[] PROGMEM = R"rawliteral(
   <section id="sensor-tab" class="tab-content">
     <h3>Sensor</h3>
     <div>Depth: <span id='sensor-value'>&mdash;</span> &plusmn; <span id='sensor-sd'>&mdash;</span>&nbsp;m</div>
-    <div>Raw value: <span id='sensor-raw'>&mdash;</span></div>
+    <div>Raw pressure: <span id='sensor-raw'>&mdash;</span></div>
     <div class='error' id='sensor-error'></div>
   </section>
 
@@ -115,11 +115,13 @@ const char MAIN_PAGE_HTML[] PROGMEM = R"rawliteral(
 
   <section id="calibrate-tab" class="tab-content">
     <h3>Calibrate</h3>
-    <form method="POST" action="/calibrate" autocomplete="off">
-      <label for="calibrate-coeff">Raw value per depth unit (default = 120):</label>
-      <input type="number" id="calibrate-coeff" name="rawPerDepth">
-      <label for="calibrate-offset">Depth offset (default = 0 (m)):</label>
-      <input type="number" id="calibrate-offset" name="depthOffset">
+    <p><code>h = (p - p0) / k</code></p>
+    <p>where <b>p</b> is measured pressure, <b>h</b> is computed depth.
+    <form method="POST" action="/calibration" autocomplete="off">
+      <label for="calibrate-coeff"><b>k</b> (&#x3c1;&times;g) (default: 120):</label>
+      <input type="number" id="calibrate-coeff" name="kCoeff" min="1" max="1000" step="0.0001">
+      <label for="calibrate-offset"><b>p0</b> (default: 100):</label>
+      <input type="number" id="calibrate-offset" name="pZero" min="-1000" max="1000" step="0.0001">
       <input type="submit" value="Apply">
     </form>
     <div class='error' id='calibrate-error'></div>
