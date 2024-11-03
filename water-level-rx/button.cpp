@@ -10,11 +10,11 @@ bool Button::isPressed() {
 }
 
 bool Button::isPressedFor(uint32_t time, uint32_t span) {
-  return this->pressed && time >= span && this->lastToggleTime < (time - span);
+  return this->pressed && time - this->lastToggleTime >= span;
 }
 
 bool Button::isReleasedFor(uint32_t time, uint32_t span) {
-  return !this->pressed && time >= span && this->lastToggleTime < (time - span);
+  return !this->pressed && time - this->lastToggleTime >= span;
 }
 
 void Button::update(uint32_t time) {

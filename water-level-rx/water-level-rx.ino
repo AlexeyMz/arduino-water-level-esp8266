@@ -95,11 +95,11 @@ public:
   }
 
   bool isInactiveFor(uint32_t time, uint32_t span) {
-    return time >= (lastActivityTime + span);
+    return time - lastActivityTime >= span;
   }
 
   bool hasNotRequestedSensorFor(uint32_t time, uint32_t span) {
-    return time >= (lastSensorRequestTime + span);
+    return time - lastSensorRequestTime >= span;
   }
 
   void start(ConnectMode mode) {
@@ -306,7 +306,7 @@ void setup() {
 void loop() {
   auto time = millis();
 
-  if (time >= lastSensorRead + SENSOR_READ_INTERVAL) {
+  if (time - lastSensorRead >= SENSOR_READ_INTERVAL) {
     readSensorValue();
   }
   

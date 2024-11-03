@@ -12,7 +12,7 @@ private:
   uint16_t onSpan = 0;
   uint16_t offSpan = 0;
   BlinkState state = BlinkState::None;
-  uint32_t nextSwitchTime = 0;
+  uint32_t lastSwitchTime = 0;
 
 public:
   bool isOn();

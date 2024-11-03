@@ -18,19 +18,19 @@ bool BlinkPattern::update(uint32_t time) {
   switch (this->state) {
     case BlinkState::None:
       this->state = BlinkState::On;
-      this->nextSwitchTime = time + this->onSpan;
+      this->lastSwitchTime = time;
       return true;
     case BlinkState::On:
-      if (this->offSpan > 0 && time >= this->nextSwitchTime) {
+      if (this->offSpan > 0 && time - this->lastSwitchTime >= this->onSpan) {
         this->state = BlinkState::Off;
-        this->nextSwitchTime += this->offSpan;
+        this->lastSwitchTime = time;
         return true;
       }
       break;
     case BlinkState::Off:
-      if (this->onSpan > 0 && time >= this->nextSwitchTime) {
+      if (this->onSpan > 0 && time - this->lastSwitchTime >= this->offSpan) {
         this->state = BlinkState::On;
-        this->nextSwitchTime += this->onSpan;
+        this->lastSwitchTime = time;
         return true;
       }
       break;
