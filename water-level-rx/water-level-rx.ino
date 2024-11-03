@@ -32,10 +32,12 @@ BlinkPattern blinking;
 RgbColor ledColor = { 0, 0, 0 };
 
 const uint16_t SENSOR_READ_INTERVAL = 1000;
-const size_t SENSOR_VALUES_COUNT = 10;
+const size_t SENSOR_VALUES_COUNT = 300;
 uint32_t lastSensorRead = 0;
 size_t nextSensorValueIndex = 0;
+bool hasFullSensorBuffer = false;
 int sensorValues[SENSOR_VALUES_COUNT];
+float sensorAverage = 0;
 
 const uint16_t ASSUME_INACTIVE_TIMEOUT = 5000;
 
@@ -144,14 +146,15 @@ protected:
 
     float rawPressure = 0;
     float depth = 0;
-    float depthDeviation = 0;
-    computeSensorData(rawPressure, depth, depthDeviation);
+    size_t sampleCount = 0;
+    computeSensorData(rawPressure, depth, sampleCount);
 
     JsonDocument doc;
     doc["rawPressure"] = rawPressure;
     doc["depth"] = depth;
-    doc["depthSd"] = depthDeviation;
     doc["depthUnit"] = "m";
+    doc["sampleCount"] = sampleCount;
+    doc["sampleInterval"] = SENSOR_READ_INTERVAL;
 
     std::string response;
     serializeJsonPretty(doc, response);
@@ -291,11 +294,10 @@ void setup() {
     storedData.calibrationPZero = DEFAULT_P_ZERO;
   }
 
-  int initial_sensor_value = analogRead(A0);
   for (size_t i = 0; i < SENSOR_VALUES_COUNT; i++) {
-    sensorValues[i] = initial_sensor_value;
+    sensorValues[i] = 0;
   }
-  lastSensorRead = millis();
+  readSensorValue();
 
   transitionToState(State::Initial);
   server.start(WlrxServer::ConnectMode::Default);
@@ -305,12 +307,7 @@ void loop() {
   auto time = millis();
 
   if (time >= lastSensorRead + SENSOR_READ_INTERVAL) {
-    sensorValues[nextSensorValueIndex] = analogRead(A0);
-    nextSensorValueIndex++;
-    if (nextSensorValueIndex >= SENSOR_VALUES_COUNT) {
-      nextSensorValueIndex = 0;
-    }
-    lastSensorRead = time;
+    readSensorValue();
   }
   
   if (state != State::Initial) {
@@ -430,24 +427,35 @@ void writeLedColor(byte r, byte g, byte b) {
   analogWrite(B_PIN, b);
 }
 
+void readSensorValue() {
+  int nextValue = analogRead(A0);
+
+  if (hasFullSensorBuffer) {
+    int previousValue = sensorValues[nextSensorValueIndex];
+    float nextFloat = static_cast<float>(nextValue);
+    // Simple moving average
+    sensorAverage += (nextFloat - previousValue) / SENSOR_VALUES_COUNT;
+  } else {
+    sensorValues[nextSensorValueIndex] = nextValue;
+    // Cumulative average
+    sensorAverage += (nextValue - sensorAverage) / (nextSensorValueIndex + 1);
+  }
+  
+  nextSensorValueIndex++;
+  if (nextSensorValueIndex >= SENSOR_VALUES_COUNT) {
+    nextSensorValueIndex = 0;
+    hasFullSensorBuffer = true;
+  }
+
+  lastSensorRead = millis();
+}
+
 void computeSensorData(
   float &rawPressure,
   float &depth,
-  float &depthDeviation
+  size_t &sampleCount
 ) {
-  float average = 0;
-  for (auto value : sensorValues) {
-    average += value;
-  }
-  average /= SENSOR_VALUES_COUNT;
-
-  float variance = 0;
-  for (auto value : sensorValues) {
-    float difference = (value - average);
-    variance += difference * difference;
-  }
-  
-  rawPressure = average;
-  depth = (average - storedData.calibrationPZero) / storedData.calibrationKCoeff;
-  depthDeviation = sqrt(variance) / storedData.calibrationKCoeff;
+  rawPressure = sensorAverage;
+  depth = (sensorAverage - storedData.calibrationPZero) / storedData.calibrationKCoeff;
+  sampleCount = hasFullSensorBuffer ? SENSOR_VALUES_COUNT : nextSensorValueIndex;
 }

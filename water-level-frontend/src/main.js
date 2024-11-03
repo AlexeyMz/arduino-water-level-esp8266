@@ -29,8 +29,9 @@ document.addEventListener('DOMContentLoaded', () => {
     try {
       const data = await fetchJson('/sensor');
       $('#sensor-value').innerText = data.depth.toFixed(2);
-      $('#sensor-sd').innerText = data.depthSd.toFixed(2);
       $('#sensor-raw').innerText = data.rawPressure.toFixed(4);
+      $('#sensor-count').innerText = data.sampleCount;
+      $('#sensor-interval').innerText = data.sampleInterval;
       $('#sensor-error').innerText = '';
     } catch (e) {
       $('#sensor-error').innerText = e.message;
