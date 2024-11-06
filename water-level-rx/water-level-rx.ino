@@ -436,10 +436,11 @@ void readSensorValue() {
     // Simple moving average
     sensorAverage += (nextFloat - previousValue) / SENSOR_VALUES_COUNT;
   } else {
-    sensorValues[nextSensorValueIndex] = nextValue;
     // Cumulative average
     sensorAverage += (nextValue - sensorAverage) / (nextSensorValueIndex + 1);
   }
+
+  sensorValues[nextSensorValueIndex] = nextValue;
   
   nextSensorValueIndex++;
   if (nextSensorValueIndex >= SENSOR_VALUES_COUNT) {
